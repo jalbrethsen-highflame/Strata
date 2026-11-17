@@ -269,6 +269,7 @@ __global__ void k_router(const float* logits, const float* bias, int n_expert, i
             const int oi = __shfl_xor_sync(0xffffffffu, id, x);
             if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
         }
+        if (id == 0x7fffffff) id = k;   // no finite score (a NaN row): any valid id, never an out-of-range read
         if ((id & 31) == lane) {
             sel[id >> 5] = -INFINITY;
             pk[k] = p[id >> 5];
@@ -325,41 +326,77 @@ __global__ void k_gemv_f32(const float* W, const float* x, float* y, int n_in, i
     if (lane == 0) y[(size_t) blockIdx.y * n_out + o] = acc;
 }
 
-/// A layer's KV cache: FP16 [kvh][ctx][128] (k / v), or 8-bit (k8 / v8, the same layout, one float scale per
-/// (kvh, cell): absmax / 127 over the head's 128 values).
+/// A layer's KV cache.  FP16 (k / v) or 8-bit (k8 / v8, one float scale per (kvh, cell): absmax / 127 over the head's
+/// 128 values), [kvh][dstride][128] in VRAM.  --kv-host (8-bit): the VRAM region holds only the cells < `first` (the
+/// prefix blocks and all of a context below 4096), a ring of the newest `ring` cells (the local blocks and recent routes)
+/// sits beside it, and every cell is kept in pinned host memory (k8h ..., mapped, [kvh][hstride]): MBSA reads 32
+/// blocks per KV group, so the other blocks stay in host memory and are read over PCIe when routed.
 struct KVP {
     __half *k = nullptr, *v = nullptr;
     int8_t *k8 = nullptr, *v8 = nullptr;
     float *ks = nullptr, *vs = nullptr;
+    int dstride = 0, first = 0x7fffffff;
+    int8_t *k8r = nullptr, *v8r = nullptr;   // the ring (null: none)
+    float *ksr = nullptr, *vsr = nullptr;
+    int ring = 0;
+    int8_t *k8h = nullptr, *v8h = nullptr;   // the host copy (null: none)
+    float *ksh = nullptr, *vsh = nullptr;
+    int hstride = 0;
 };
-/// 8 consecutive values (dims 8c .. 8c + 7) of cell `row` (= kvh * ctx + pos) of K (or V) as FP16 into dst.
-__device__ __forceinline__ void kv_copy8(const KVP& kv, bool isv, size_t row, int c, __half* dst) {
-    if (kv.k8) {
-        const int8_t* src = (isv ? kv.v8 : kv.k8) + row * kHD + c * 8;
-        const float sc = (isv ? kv.vs : kv.ks)[row];
-        const uint2 raw = *(const uint2*) src;
-        const int8_t* b = (const int8_t*) &raw;
-        __align__(16) __half o[8];
-        for (int i = 0; i < 8; ++i) o[i] = __float2half((float) b[i] * sc);
-        *(uint4*) dst = *(const uint4*) o;
+constexpr int kRingMargin = 8;   // ring cells this close to the oldest one are read from the host (a rollback's rewrites)
+/// Where 8-bit cell (g, pos) is read; `hi` = the newest cell written (the ring holds hi - ring + 1 .. hi).
+__device__ __forceinline__ void kv_loc8(const KVP& kv, bool isv, int g, int pos, int hi, const int8_t*& qp, float& sc) {
+    size_t r;
+    if (!kv.k8h || pos < kv.first) {
+        r = (size_t) g * kv.dstride + pos;
+        qp = (isv ? kv.v8 : kv.k8) + r * kHD;
+        sc = (isv ? kv.vs : kv.ks)[r];
+    } else if (kv.k8r && pos > hi - kv.ring + kRingMargin) {
+        r = (size_t) g * kv.ring + pos % kv.ring;
+        qp = (isv ? kv.v8r : kv.k8r) + r * kHD;
+        sc = (isv ? kv.vsr : kv.ksr)[r];
     } else {
-        *(uint4*) dst = *(const uint4*) ((isv ? kv.v : kv.k) + row * kHD + c * 8);
+        r = (size_t) g * kv.hstride + pos;
+        qp = (isv ? kv.v8h : kv.k8h) + r * kHD;
+        sc = (isv ? kv.vsh : kv.ksh)[r];
     }
 }
-__device__ __forceinline__ float kv_get(const KVP& kv, bool isv, size_t row, int d) {
-    if (kv.k8) return (float) (isv ? kv.v8 : kv.k8)[row * kHD + d] * (isv ? kv.vs : kv.ks)[row];
-    return __half2float((isv ? kv.v : kv.k)[row * kHD + d]);
+/// 8 consecutive values (dims 8c .. 8c + 7) of cell (g, pos) of K (or V) as FP16 into dst.
+__device__ __forceinline__ void kv_copy8(const KVP& kv, bool isv, int g, int pos, int hi, int c, __half* dst) {
+    if (kv.k8) {
+        const int8_t* src;
+        float sc;
+        kv_loc8(kv, isv, g, pos, hi, src, sc);
+        const uint2 raw = *(const uint2*) (src + c * 8);
+        const int8_t* bq = (const int8_t*) &raw;
+        __align__(16) __half o[8];
+        for (int i = 0; i < 8; ++i) o[i] = __float2half((float) bq[i] * sc);
+        *(uint4*) dst = *(const uint4*) o;
+    } else {
+        *(uint4*) dst = *(const uint4*) ((isv ? kv.v : kv.k) + ((size_t) g * kv.dstride + pos) * kHD + c * 8);
+    }
 }
-/// The 8-bit cache's cells [0, P) of each KV head as FP16 into k16 / v16 (the FP16 layout): the dense prompt path's
-/// cuBLAS operands.  grid1(HKV * P * 128).
+__device__ __forceinline__ float kv_get(const KVP& kv, bool isv, int g, int pos, int hi, int d) {
+    if (kv.k8) {
+        const int8_t* src;
+        float sc;
+        kv_loc8(kv, isv, g, pos, hi, src, sc);
+        return (float) src[d] * sc;
+    }
+    return __half2float((isv ? kv.v : kv.k)[((size_t) g * kv.dstride + pos) * kHD + d]);
+}
+/// Cells [0, P) of each KV head as FP16 into k16 / v16 ([kvh][ctx][128]): the dense prompt path's cuBLAS operands.
+/// grid1(HKV * P * 128).
 __global__ void k_kv_deq(KVP kv, __half* k16, __half* v16, int ctx, int P, int HKV) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (int64_t) HKV * P * kHD) return;
     const int64_t per = (int64_t) P * kHD;
-    const int64_t g = i / per, rest = i % per, pos = rest / kHD, d = rest % kHD;
+    const int g = (int) (i / per);
+    const int64_t rest = i % per;
+    const int pos = (int) (rest / kHD), d = (int) (rest % kHD);
     const size_t row = (size_t) g * ctx + pos;
-    k16[row * kHD + d] = __float2half(kv_get(kv, false, row, d));
-    v16[row * kHD + d] = __float2half(kv_get(kv, true, row, d));
+    k16[row * kHD + d] = __float2half(kv_get(kv, false, g, pos, P - 1, d));
+    v16[row * kHD + d] = __float2half(kv_get(kv, true, g, pos, P - 1, d));
 }
 
 /// The attention's per-row preparation, grid (H + HKV, T), block 128: q / k RMS-normed per head with their weights,
@@ -388,15 +425,22 @@ __global__ void k_attn_prep(const float* qx, const float* kx, const float* vx, c
         q[((size_t) t * H + head) * kHD + i] = v;
     } else {
         const int kh = head - H;
-        const size_t row = (size_t) kh * ctx + pos;
         const float vv = vx[((size_t) t * HKV + kh) * kHD + i];
+        (void) ctx;
         if (kv.k8) {   // per-cell absmax scales (the block is one head: uniform branch)
             const float ka = block_max(fabsf(v), sh), va = block_max(fabsf(vv), sh);
             const float ksc = ka > 0.f ? ka / 127.f : 1.f, vsc = va > 0.f ? va / 127.f : 1.f;
-            kv.k8[row * kHD + i] = (int8_t) __float2int_rn(v / ksc);
-            kv.v8[row * kHD + i] = (int8_t) __float2int_rn(vv / vsc);
-            if (i == 0) { kv.ks[row] = ksc; kv.vs[row] = vsc; }
+            const int8_t kq = (int8_t) __float2int_rn(v / ksc), vq = (int8_t) __float2int_rn(vv / vsc);
+            auto put = [&](int8_t* k8, int8_t* v8, float* ks, float* vs, size_t r) {
+                k8[r * kHD + i] = kq;
+                v8[r * kHD + i] = vq;
+                if (i == 0) { ks[r] = ksc; vs[r] = vsc; }
+            };
+            if (!kv.k8h || pos < kv.first) put(kv.k8, kv.v8, kv.ks, kv.vs, (size_t) kh * kv.dstride + pos);
+            if (kv.k8h) put(kv.k8h, kv.v8h, kv.ksh, kv.vsh, (size_t) kh * kv.hstride + pos);
+            if (kv.k8r) put(kv.k8r, kv.v8r, kv.ksr, kv.vsr, (size_t) kh * kv.ring + pos % kv.ring);
         } else {
+            const size_t row = (size_t) kh * kv.dstride + pos;
             kv.k[row * kHD + i] = __float2half(v);
             kv.v[row * kHD + i] = __float2half(vv);
         }
@@ -405,7 +449,7 @@ __global__ void k_attn_prep(const float* qx, const float* kx, const float* vx, c
 
 /// Split-K decode attention: one block per (256-cell chunk, query row); row = t * H + h sees cells [0, *pos0 + t].
 __global__ void k_attn_part(const float* q, KVP kv, const int32_t* pos0, int t0, int H,
-                            int HKV, int ctx, float scale, int n_chunk, float* pacc, float* pm, float* pl) {
+                            int HKV, int Ttot, float scale, int n_chunk, float* pacc, float* pm, float* pl) {
     __shared__ float qs[kHD], sc[kChunkCells], sh[kChunkCells];
     const int c = blockIdx.x, row = blockIdx.y;
     const int t = t0 + row / H, h = row % H, kvh = h / (H / HKV);
@@ -416,19 +460,22 @@ __global__ void k_attn_part(const float* q, KVP kv, const int32_t* pos0, int t0,
     if (j < kHD) qs[j] = q[((size_t) t * H + h) * kHD + j];
     __syncthreads();
     const int p = p0 + j;
+    const int hi = *pos0 + Ttot - 1;
     float s = -INFINITY;
     if (p < npos) {
-        const size_t row = (size_t) kvh * ctx + p;
         float a = 0.f;
         if (kv.k8) {
-            const char2* kp = (const char2*) (kv.k8 + row * kHD);
+            const int8_t* kq;
+            float ksc;
+            kv_loc8(kv, false, kvh, p, hi, kq, ksc);
+            const char2* kp = (const char2*) kq;
             for (int i = 0; i < kHD / 2; ++i) {
                 const char2 c = kp[i];
                 a += qs[2 * i] * (float) c.x + qs[2 * i + 1] * (float) c.y;
             }
-            a *= kv.ks[row];
+            a *= ksc;
         } else {
-            const __half2* kp = (const __half2*) (kv.k + row * kHD);
+            const __half2* kp = (const __half2*) (kv.k + ((size_t) kvh * kv.dstride + p) * kHD);
             for (int i = 0; i < kHD / 2; ++i) {
                 const float2 k2 = __half22float2(kp[i]);
                 a += qs[2 * i] * k2.x + qs[2 * i + 1] * k2.y;
@@ -444,9 +491,14 @@ __global__ void k_attn_part(const float* q, KVP kv, const int32_t* pos0, int t0,
     const size_t o = (size_t) row * n_chunk + c;
     if (j < kHD) {
         float acc = 0.f;
-        const size_t row0 = (size_t) kvh * ctx + p0;
+        const size_t row0 = (size_t) kvh * kv.dstride + p0;
         if (kv.k8) {
-            for (int k = 0; k < n; ++k) acc += sc[k] * kv.vs[row0 + k] * (float) kv.v8[(row0 + k) * kHD + j];
+            for (int k = 0; k < n; ++k) {
+                const int8_t* vq;
+                float vsc;
+                kv_loc8(kv, true, kvh, p0 + k, hi, vq, vsc);
+                acc += sc[k] * vsc * (float) vq[j];
+            }
         } else {
             for (int k = 0; k < n; ++k) acc += sc[k] * __half2float(kv.v[(row0 + k) * kHD + j]);
         }
@@ -648,7 +700,7 @@ __global__ void k_route_blocks(const float* bs, int n_blocks, const int32_t* pos
 /// for (row t, group g, route slot r) the block's keys k <= pos against the group's 8 query heads: per head the max,
 /// the sum of exp and the exp-weighted V sum.
 __global__ void k_sparse_part(const float* q, KVP kv, const int32_t* route, const int32_t* pos0,
-                              int t0, int H, int HKV, int ctx, float scale, float* pacc, float* pm, float* pl) {
+                              int t0, int H, int HKV, int Ttot, float scale, float* pacc, float* pm, float* pl) {
     extern __shared__ __align__(16) unsigned char smem[];
     __half* Ks = (__half*) smem;
     __half* Vs = Ks + kBlk * kHD;
@@ -666,11 +718,11 @@ __global__ void k_sparse_part(const float* q, KVP kv, const int32_t* route, cons
     const int k0 = b * kBlk;
     const int nk = min(kBlk, pos + 1 - k0);   // keys <= pos
     {   // K / V block into shared memory (16-byte loads)
-        const size_t row0 = (size_t) g * ctx + k0;
         const int n16 = nk * kHD / 8;
+        const int hi = *pos0 + Ttot - 1;
         for (int i = tid; i < n16; i += blockDim.x) {
-            kv_copy8(kv, false, row0 + i / (kHD / 8), i % (kHD / 8), Ks + (size_t) i * 8);
-            kv_copy8(kv, true, row0 + i / (kHD / 8), i % (kHD / 8), Vs + (size_t) i * 8);
+            kv_copy8(kv, false, g, k0 + i / (kHD / 8), hi, i % (kHD / 8), Ks + (size_t) i * 8);
+            kv_copy8(kv, true, g, k0 + i / (kHD / 8), hi, i % (kHD / 8), Vs + (size_t) i * 8);
         }
         for (int i = tid; i < G * kHD; i += blockDim.x) qsh[i / kHD][i % kHD] = q[((size_t) t * H + g * G + i / kHD) * kHD + i % kHD];
     }
@@ -794,10 +846,10 @@ __global__ void __launch_bounds__(128) k_sparse_tile(const float* q, KVP kv, con
                 const int k0 = b * kBlk + half * sp::KS;
                 __syncthreads();
                 {   // K half -> Ks
-                    const size_t row0 = (size_t) g * ctx + k0;
                     for (int i = tid; i < sp::KS * kHD / 8; i += blockDim.x) {
                         const int r = i / (kHD / 8), c = i % (kHD / 8);
-                        kv_copy8(kv, false, row0 + r, c, Ks + r * sp::LDH + c * 8);
+                        if (k0 + r <= p0 + T - 1) kv_copy8(kv, false, g, k0 + r, p0 + T - 1, c, Ks + r * sp::LDH + c * 8);
+                        else *(uint4*) (Ks + r * sp::LDH + c * 8) = make_uint4(0, 0, 0, 0);   // never written: zeros
                     }
                 }
                 __syncthreads();
@@ -856,10 +908,10 @@ __global__ void __launch_bounds__(128) k_sparse_tile(const float* q, KVP kv, con
                 __syncthreads();   // S is dead: the V half takes its place
                 {
                     __half* Vs = (__half*) SV;
-                    const size_t row0 = (size_t) g * ctx + k0;
                     for (int i = tid; i < sp::KS * kHD / 8; i += blockDim.x) {
                         const int r = i / (kHD / 8), c = i % (kHD / 8);
-                        kv_copy8(kv, true, row0 + r, c, Vs + r * sp::LDH + c * 8);
+                        if (k0 + r <= p0 + T - 1) kv_copy8(kv, true, g, k0 + r, p0 + T - 1, c, Vs + r * sp::LDH + c * 8);
+                        else *(uint4*) (Vs + r * sp::LDH + c * 8) = make_uint4(0, 0, 0, 0);
                     }
                 }
                 __syncthreads();
@@ -957,12 +1009,14 @@ __global__ void __launch_bounds__(128) k_sparse_fa2(const float* q, KVP kv, cons
             for (int hf = 0; hf < kBlk / KS; ++hf) {
                 const int k0 = b * kBlk + hf * KS;
                 if (hf) __syncthreads();
-                {
-                    const size_t row0 = (size_t) g * ctx + k0;
-                    for (int i = tid; i < KS * kHD / 8; i += blockDim.x) {
-                        const int r = i / (kHD / 8), c = i % (kHD / 8);
-                        kv_copy8(kv, false, row0 + r, c, Ks + r * LD + c * 8);
-                        kv_copy8(kv, true, row0 + r, c, Vs + r * LD + c * 8);
+                for (int i = tid; i < KS * kHD / 8; i += blockDim.x) {
+                    const int r = i / (kHD / 8), c = i % (kHD / 8);
+                    if (k0 + r <= p0 + T - 1) {
+                        kv_copy8(kv, false, g, k0 + r, p0 + T - 1, c, Ks + r * LD + c * 8);
+                        kv_copy8(kv, true, g, k0 + r, p0 + T - 1, c, Vs + r * LD + c * 8);
+                    } else {   // cells past the newest are never written (a borrowed staging buffer holds old bytes): zeros
+                        *(uint4*) (Ks + r * LD + c * 8) = make_uint4(0, 0, 0, 0);
+                        *(uint4*) (Vs + r * LD + c * 8) = make_uint4(0, 0, 0, 0);
                     }
                 }
                 __syncthreads();
@@ -1671,6 +1725,11 @@ struct Engine {
     std::vector<KVP> kvs;               // per layer: the KV cache (FP16 or 8-bit, --kv)
     std::vector<__half*> ikc;           // per layer: the indexer K cache (FP16)
     bool kv8 = false;
+    bool kv_host = false;                   // --kv-host: the main layers' KV in pinned host memory (see KVP)
+    int kv_first = 4096, kv_ring = 4096;
+    int64_t ring_upto = -1;                 // the ring holds the cells before and up to this one (-1: to be refilled)
+    std::vector<uint8_t*> kvh_base;         // per main layer: its host block (k8 | v8 | ks | vs)
+    uint8_t* kvstage = nullptr;             // a streamed prompt's per-layer staging of the host KV (in the arena)
     __half *kd16 = nullptr, *vd16 = nullptr;   // --kv q8: the dense prompt path's FP16 copies [HKV][ctx][128]
     float *spacc = nullptr, *spm = nullptr, *spl = nullptr;
     static constexpr int kSparseRows = 64;   // rows per sparse attention launch (the partials' size)
@@ -1966,12 +2025,40 @@ struct Engine {
         pl = dalloc((size_t) att_rows * n_chunk);
         for (size_t l = 0; l < m->layers.size(); ++l) {
             KVP kv;
-            if (kv8) {
+            const bool host = kv_host && l < (size_t) m->n_layers;   // the MTP layer's dense attention: all in VRAM
+            if (kv8 && host) {
+                const size_t F = (size_t) std::min(kv_first, ctx), R = (size_t) kv_ring;
+                kv.dstride = (int) F;
+                kv.first = (int) F;
+                kv.k8 = dalloc_t<int8_t>(HKV * F * kHD);
+                kv.v8 = dalloc_t<int8_t>(HKV * F * kHD);
+                kv.ks = dalloc(HKV * F);
+                kv.vs = dalloc(HKV * F);
+                kv.ring = (int) R;
+                kv.k8r = dalloc_t<int8_t>(HKV * R * kHD);
+                kv.v8r = dalloc_t<int8_t>(HKV * R * kHD);
+                kv.ksr = dalloc(HKV * R);
+                kv.vsr = dalloc(HKV * R);
+                const size_t C = (size_t) ctx, nb = HKV * C * (2 * kHD + 8);
+                uint8_t* hb = nullptr;
+                CK(cudaHostAlloc((void**) &hb, nb, cudaHostAllocMapped | cudaHostAllocPortable));
+                std::memset(hb, 0, nb);
+                uint8_t* db = nullptr;
+                CK(cudaHostGetDevicePointer((void**) &db, hb, 0));
+                kvh_base.push_back(hb);
+                kv.k8h = (int8_t*) db;
+                kv.v8h = (int8_t*) (db + HKV * C * kHD);
+                kv.ksh = (float*) (db + 2 * HKV * C * kHD);
+                kv.vsh = (float*) (db + 2 * HKV * C * kHD + HKV * C * 4);
+                kv.hstride = (int) C;
+            } else if (kv8) {
+                kv.dstride = ctx;
                 kv.k8 = dalloc_t<int8_t>(HKV * ctx * kHD);
                 kv.v8 = dalloc_t<int8_t>(HKV * ctx * kHD);
                 kv.ks = dalloc(HKV * ctx);
                 kv.vs = dalloc(HKV * ctx);
             } else {
+                kv.dstride = ctx;
                 kv.k = dalloc_t<__half>(HKV * ctx * kHD);
                 kv.v = dalloc_t<__half>(HKV * ctx * kHD);
             }
@@ -1997,13 +2084,69 @@ struct Engine {
         CK(cudaDeviceSynchronize());
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
+        if (kv_host)
+            std::fprintf(stderr, "strata-mx: --kv-host: the main layers' KV in pinned host memory (%.2f GiB), cells < %d and a ring of "
+                         "%d in VRAM\n", (double) m->n_layers * HKV * ctx * (2 * kHD + 8) / (1 << 30), kv_first, kv_ring);
         std::fprintf(stderr, "strata-mx: context %d cells (%s KV + indexer K, %.2f GiB), prompt chunk %d, %s attention, %.2f GiB "
                      "of VRAM free\n", ctx, kv8 ? "8-bit" : "FP16",
                      (double) ((kv8 ? 2 * HKV * (kHD + 4) : 2 * HKV * kHD * 2) + kIdxDim * 2) * (size_t) ctx * m->layers.size() / (1 << 30),
                      tmax, force_dense ? "dense (STRATA_MX_DENSE)" : "block-sparse (MBSA) past 4096", (double) fr / (1 << 30));
     }
 
-    void reset() { pos = 0; }
+    void reset() {
+        pos = 0;
+        ring_upto = -1;
+    }
+    /// --kv-host: the ring refilled from the host copy when the next forward does not continue it (a prefix reuse, a KV
+    /// file read, a rollback past the margin): cells max(first, p0 - ring + margin) .. p0 - 1.
+    void ring_sync(int64_t p0) {
+        if (!kv_host) return;
+        if (ring_upto >= 0 && p0 <= ring_upto + 1 && p0 >= ring_upto + 1 - (kRingMargin - 1)) return;
+        const int64_t lo = std::max<int64_t>(kv_first, p0 - kv_ring + kRingMargin), hi = p0;   // [lo, hi)
+        const size_t HKV = (size_t) m->n_head_kv, C = (size_t) ctx, R = (size_t) kv_ring;
+        for (size_t li = 0; li < (size_t) m->n_layers && lo < hi; ++li) {
+            const KVP& kv = kvs[li];
+            const uint8_t* hb = kvh_base[li];
+            const int8_t* hk = (const int8_t*) hb;
+            const int8_t* hv = (const int8_t*) (hb + HKV * C * kHD);
+            const float* hks = (const float*) (hb + 2 * HKV * C * kHD);
+            const float* hvs = hks + HKV * C;
+            for (size_t g = 0; g < HKV; ++g)
+                for (int64_t a = lo; a < hi;) {   // runs that do not wrap the ring
+                    const int64_t slot = a % (int64_t) R, n = std::min<int64_t>(hi - a, (int64_t) R - slot);
+                    const size_t hr = g * C + (size_t) a, rr = g * R + (size_t) slot;
+                    CK(cudaMemcpyAsync(kv.k8r + rr * kHD, hk + hr * kHD, (size_t) n * kHD, cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(kv.v8r + rr * kHD, hv + hr * kHD, (size_t) n * kHD, cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(kv.ksr + rr, hks + hr, (size_t) n * 4, cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(kv.vsr + rr, hvs + hr, (size_t) n * 4, cudaMemcpyHostToDevice, st));
+                    a += n;
+                }
+        }
+        ring_upto = p0 - 1;
+    }
+    /// --kv-host: the VRAM first region refilled from the host copy for cells [a, b) (after a KV file read or a streamed
+    /// prompt, which write the host copy only).
+    void first_sync(int64_t a, int64_t b) {
+        if (!kv_host) return;
+        b = std::min<int64_t>(b, kv_first);
+        if (a >= b) return;
+        const size_t HKV = (size_t) m->n_head_kv, C = (size_t) ctx, F = (size_t) kv_first;
+        for (size_t li = 0; li < (size_t) m->n_layers; ++li) {
+            const KVP& kv = kvs[li];
+            const uint8_t* hb = kvh_base[li];
+            const int8_t* hk = (const int8_t*) hb;
+            const int8_t* hv = (const int8_t*) (hb + HKV * C * kHD);
+            const float* hks = (const float*) (hb + 2 * HKV * C * kHD);
+            const float* hvs = hks + HKV * C;
+            for (size_t g = 0; g < HKV; ++g) {
+                const size_t hr = g * C + (size_t) a, dr = g * F + (size_t) a, n = (size_t) (b - a);
+                CK(cudaMemcpyAsync(kv.k8 + dr * kHD, hk + hr * kHD, n * kHD, cudaMemcpyHostToDevice, st));
+                CK(cudaMemcpyAsync(kv.v8 + dr * kHD, hv + hr * kHD, n * kHD, cudaMemcpyHostToDevice, st));
+                CK(cudaMemcpyAsync(kv.ks + dr, hks + hr, n * 4, cudaMemcpyHostToDevice, st));
+                CK(cudaMemcpyAsync(kv.vs + dr, hvs + hr, n * 4, cudaMemcpyHostToDevice, st));
+            }
+        }
+    }
 
     // ---- dense products: T <= kGemmT on the native MMVQ (q8_1 activations), else the FP16 GEMM
     void quant(const float* xin, int n, int T, void* qd) { K::native_quantize_q8_1(xin, qd, n * T, 1, st); }
@@ -2128,7 +2271,7 @@ struct Engine {
                 for (int t0 = 0; t0 < T; t0 += kSparseRows) {
                     const int nt = std::min(kSparseRows, T - t0);
                     k_sparse_part<<<dim3(kRoute, nt * HKV), 256, 2 * kBlk * kHD * 2, st>>>(q, kvs[li], route, pos0, t0, H,
-                                                                                        HKV, ctx, scale, spacc, spm, spl);
+                                                                                        HKV, T, scale, spacc, spm, spl);
                     k_sparse_merge<<<nt * H, kHD, 0, st>>>(spacc, spm, spl, t0, H, HKV, att);
                 }
             }
@@ -2183,7 +2326,7 @@ struct Engine {
                 const int nt = std::min(rows_per, T - t0);
                 const int nc = graph_mode ? n_chunk
                                           : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
-                k_attn_part<<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, kvs[li], pos0, t0, H, HKV, ctx, scale,
+                k_attn_part<<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, kvs[li], pos0, t0, H, HKV, T, scale,
                                                                      n_chunk, pacc, pm, pl);
                 k_attn_merge<<<nt * H, kHD, 0, st>>>(pacc, pm, pl, pos0, t0, H, n_chunk, att);
             }
@@ -2429,12 +2572,17 @@ struct Engine {
     }
     size_t stage_al() const { return (stage_bytes + 255) / 256 * 256; }
     size_t xall_bytes(int64_t n) const { return ((size_t) n * kHC * m->n_embd * 4 + 255) / 256 * 256; }
+    /// --kv-host: a streamed prompt's staging of one layer's KV, cells [0, end) of every KV head (k8 | v8 | ks | vs).
+    size_t kvstage_bytes(int64_t end) const {
+        return kv_host ? ((size_t) m->n_head_kv * (size_t) end * (2 * kHD + 8) + 255) / 256 * 256 : 0;
+    }
     /// The big set's chunk for a prompt of n tokens: tbig, halved while staging + the streams + the set do not fit the
     /// arena (0: no streamed prompt).
     int stream_chunk(int64_t n) {
         if (!use_stream || n < stream_min) return 0;
         for (int tb = tbig; tb >= 128; tb /= 2)
-            if (2 * stage_al() + xall_bytes(n) + rows_bytes(tb) <= arena_bytes && (n + tb - 1) / tb <= (int64_t) (ctx / tsmall + 2))
+            if (2 * stage_al() + xall_bytes(n) + rows_bytes(tb) + kvstage_bytes(pos + n) <= arena_bytes &&
+                (n + tb - 1) / tb <= (int64_t) (ctx / tsmall + 2))
                 return tb;
         return 0;
     }
@@ -2446,7 +2594,7 @@ struct Engine {
         prof.begin();
         // the big row set after the staging pair and the streams, in the borrowed arena
         const RowBufs small = save_rows();
-        const size_t used = 2 * stage_al() + xall_bytes(n) + rows_bytes(tb);
+        const size_t used = 2 * stage_al() + xall_bytes(n) + rows_bytes(tb) + kvstage_bytes(p0 + n);
         {
             uint8_t* bump = arena + 2 * stage_al() + xall_bytes(n);
             alloc_rows(tb, true, [&](size_t nb) {
@@ -2455,6 +2603,7 @@ struct Engine {
                 return p;
             });
             MMQ::iota(ident, (int64_t) tb * m->top_k, st);
+            kvstage = kv_host ? bump : nullptr;
         }
         std::vector<int> seq;
         for (size_t li = 0; li < m->layers.size(); ++li)   // the main MoE layers, then the MTP layer (its prompt pass)
@@ -2480,6 +2629,32 @@ struct Engine {
         for (size_t li = 0; li < (size_t) m->n_layers; ++li) {
             const Layer& L = m->layers[li];
             const uint8_t* stg = nullptr;
+            // --kv-host: the layer's KV cells [0, p0) from the host copy into VRAM staging, read there by every chunk; the
+            // new cells go to the staging and the host copy (the first region and the ring are refilled after the prompt)
+            const KVP kv_keep = kvs[li];
+            if (kv_host) {
+                const size_t HKV = (size_t) m->n_head_kv, C = (size_t) ctx, Pc = (size_t) (p0 + n);
+                const uint8_t* hb = kvh_base[li];
+                KVP t = kv_keep;
+                t.k8 = (int8_t*) kvstage;
+                t.v8 = (int8_t*) (kvstage + HKV * Pc * kHD);
+                t.ks = (float*) (kvstage + 2 * HKV * Pc * kHD);
+                t.vs = t.ks + HKV * Pc;
+                t.dstride = (int) Pc;
+                t.first = 0x7fffffff;
+                t.k8r = t.v8r = nullptr;
+                t.ksr = t.vsr = nullptr;
+                for (size_t g = 0; g < HKV && p0 > 0; ++g) {
+                    const size_t hr = g * C, sr = g * Pc, cnt = (size_t) p0;
+                    CK(cudaMemcpyAsync(t.k8 + sr * kHD, (const int8_t*) hb + hr * kHD, cnt * kHD, cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(t.v8 + sr * kHD, (const int8_t*) (hb + HKV * C * kHD) + hr * kHD, cnt * kHD,
+                                       cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(t.ks + sr, (const float*) (hb + 2 * HKV * C * kHD) + hr, cnt * 4, cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(t.vs + sr, (const float*) (hb + 2 * HKV * C * kHD) + HKV * C + hr, cnt * 4,
+                                       cudaMemcpyHostToDevice, st));
+                }
+                kvs[li] = t;
+            }
             if (!L.dense) {
                 const auto tw = Clock::now();
                 stg = streamer.take(si);
@@ -2494,6 +2669,11 @@ struct Engine {
                 layer_ffn(L, li, T, stg);
             }
             if (!L.dense) streamer.release(si++, st);
+            kvs[li] = kv_keep;
+        }
+        if (kv_host) {   // the VRAM regions from the host copy the prompt wrote
+            first_sync(p0, p0 + n);
+            ring_upto = -1;
         }
         pos0 = psave;
         head(Xall + (size_t) (n - 1) * kHC * N, 1);
@@ -2642,6 +2822,7 @@ struct Engine {
         const int64_t p0 = pos;
         const bool sparse = !force_dense && p0 + T > kDenseUpTo;
         const int key = T * 4 + heads * 2 + (sparse ? 1 : 0);
+        ring_sync(p0);
         hpin[0] = (int32_t) p0;
         embed_host(toks, T);
         auto it = gx.find(key);
@@ -2665,6 +2846,7 @@ struct Engine {
             }
         }
         pos += T;
+        if (kv_host) ring_upto = pos - 1;
         if (m->hybrid && T <= 4 && pos / kRebalanceEvery != (pos - T) / kRebalanceEvery) rebalance(8);
     }
     /// The GPU work of a decode forward (the host has filled hpin[0] and emb_h).
@@ -2686,6 +2868,7 @@ struct Engine {
         }
         const int N = (int) m->n_embd;
         const int64_t p0 = pos;
+        ring_sync(p0);
         prof.begin();
         hpin[0] = (int32_t) p0;
         CK(cudaMemcpyAsync(pos0, hpin, 4, cudaMemcpyHostToDevice, st));
@@ -2717,6 +2900,7 @@ struct Engine {
         }
         if (heads > 0) head(X + (size_t) (T - heads) * kHC * N, heads);
         pos += T;
+        if (kv_host) ring_upto = pos - 1;
         if (m->hybrid && T <= 4 && pos / kRebalanceEvery != (pos - T) / kRebalanceEvery) {
             rebalance(8);
             prof.mark("rebalance");
@@ -3041,9 +3225,17 @@ bool kv_save(Engine& E, const Model& m, const std::string& path, const std::vect
     CK(cudaDeviceSynchronize());
     for (size_t li = 0; li < m.layers.size(); ++li) {
         const KVP& kv = E.kvs[li];
+        const bool host = E.kv_host && li < (size_t) m.n_layers;
         for (size_t g = 0; g < HKV; ++g) {
             const size_t row = g * (size_t) E.ctx;
-            if (E.kv8) {
+            if (host) {   // straight from the host copy (pinned memory)
+                const uint8_t* hb = E.kvh_base[li];
+                const size_t C = (size_t) E.ctx;
+                std::fwrite(hb + row * kHD, 1, n * kHD, f);
+                std::fwrite(hb + HKV * C * kHD + row * kHD, 1, n * kHD, f);
+                std::fwrite(hb + 2 * HKV * C * kHD + row * 4, 1, n * 4, f);
+                std::fwrite(hb + 2 * HKV * C * kHD + HKV * C * 4 + row * 4, 1, n * 4, f);
+            } else if (E.kv8) {
                 put(kv.k8 + row * kHD, n * kHD);
                 put(kv.v8 + row * kHD, n * kHD);
                 put(kv.ks + row, n * 4);
@@ -3091,9 +3283,17 @@ bool kv_load(Engine& E, const Model& m, const std::string& path, std::vector<int
     };
     for (size_t li = 0; li < m.layers.size() && ok; ++li) {
         const KVP& kv = E.kvs[li];
+        const bool host = E.kv_host && li < (size_t) m.n_layers;
         for (size_t g = 0; g < HKV; ++g) {
             const size_t row = g * (size_t) E.ctx;   // the cells at their positions in this context's layout
-            if (E.kv8) {
+            if (host) {
+                uint8_t* hb = E.kvh_base[li];
+                const size_t C = (size_t) E.ctx;
+                ok = ok && std::fread(hb + row * kHD, 1, n * kHD, f) == n * kHD;
+                ok = ok && std::fread(hb + HKV * C * kHD + row * kHD, 1, n * kHD, f) == n * kHD;
+                ok = ok && std::fread(hb + 2 * HKV * C * kHD + row * 4, 1, n * 4, f) == n * 4;
+                ok = ok && std::fread(hb + 2 * HKV * C * kHD + HKV * C * 4 + row * 4, 1, n * 4, f) == n * 4;
+            } else if (E.kv8) {
                 get(kv.k8 + row * kHD, n * kHD);
                 get(kv.v8 + row * kHD, n * kHD);
                 get(kv.ks + row, n * 4);
@@ -3112,6 +3312,8 @@ bool kv_load(Engine& E, const Model& m, const std::string& path, std::vector<int
         return false;
     }
     E.pos = (int64_t) n;
+    E.first_sync(0, (int64_t) n);
+    E.ring_upto = -1;
     std::fprintf(stderr, "strata-mx: KV of %zu tokens restored from %s in %.1f s\n", n, path.c_str(), ms_since(t0) / 1000.0);
     return true;
 }
@@ -3372,6 +3574,7 @@ int main(int argc, char** argv) {
     std::string model, dump_full, dump_layers, mtp_path;
     std::vector<int32_t> prompt, forced;
     bool pin = false;
+    bool kv_host = false;    // --kv-host: the main layers' KV in pinned host memory (8-bit; automatic from a 64K context)
     std::string kv_mode = "q8";   // --kv q8 (default) | f16
     bool serve_mode = false;
     std::string kv_file;     // --kv-file F: the held conversation's KV written at exit and read at start (--serve)
@@ -3413,6 +3616,7 @@ int main(int argc, char** argv) {
         else if (a == "--mtp") mtp_path = next();
         else if (a == "--pin-experts") pin = true;
         else if (a == "--kv") kv_mode = next();
+        else if (a == "--kv-host") kv_host = true;
         else if (a == "--mtp-min-p") mtp_min_p = (float) std::atof(next());
         else if (a == "--mtp-draft") mtp_draft = std::max(1, std::min(3, std::atoi(next())));
         else if (a == "--serve") serve_mode = true;
@@ -3452,7 +3656,8 @@ int main(int argc, char** argv) {
     Engine E;
     if (pinned) E.streamer.bounce = false;
     E.want_top_p = mtp_min_p > 0.f;
-    E.kv8 = kv_mode != "f16";   // q8 by default: the same KL against the reference, about half the KV VRAM (more slots)
+    E.kv8 = kv_mode != "f16";
+    E.kv_host = E.kv8 && (kv_host || ctx >= 65536);   // q8 by default: the same KL against the reference, about half the KV VRAM (more slots)
     E.init(m, ctx, chunk);
     vram("engine buffers + KV");
     if (!place_experts(m, E, expert_vram, threads, slots, err)) {
