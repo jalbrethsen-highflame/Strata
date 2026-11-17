@@ -8,7 +8,7 @@ Type=simple
 EnvironmentFile=%h/.config/strata-maxwell/env
 ExecStart=%h/.local/share/strata-maxwell/venv/bin/python %h/workspace/strata-maxwell/serve/maxwell_server.py \
   --engine %h/workspace/strata-maxwell/build/strata-mx --tokenizer %h/models/maxwell-v1-flash/tokenizer \
-  --host 127.0.0.1 --port 18094 --api-key-file %h/.config/strata-maxwell/api_key \
+  --host 127.0.0.1 --port 18094 \
   --log %h/.local/state/strata-maxwell/engine.log -- \
   --model %h/models/maxwell-v1-flash/Maxwell-V1-Flash-AD-Q4_K-IQ4_XS.gguf \
   --mtp %h/models/maxwell-v1-flash/Maxwell-V1-Flash-MTP.gguf \
