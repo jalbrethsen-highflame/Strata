@@ -793,6 +793,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata PRIVATE strata_qwen35)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_QWEN35=1)
   endif()
+  # Maxwell-V1-Flash (maxwell-moe): mHC + sigmoid-routed MoE, dense GQA; the experts hybrid on the CPU pool
+  if(NOT STRATA_HIP_GFX906 AND STRATA_NATIVE_EXPERTS)
+    add_executable(strata-mx src/maxwell/mx_engine.cu)
+    target_include_directories(strata-mx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+    target_link_libraries(strata-mx PRIVATE strata_prefill strata_kernels strata_kernels_cpu strata_warnings
+                          ${_strata_gpu_runtime_target})
+  endif()
 
   if(STRATA_ENABLE_HIP)
     enable_testing()
