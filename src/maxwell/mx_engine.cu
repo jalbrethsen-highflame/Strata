@@ -113,13 +113,15 @@ __global__ void k_hc_init(const float* e, float* X, int N, int64_t n) {
     for (int s = 0; s < kHC; ++s) X[(t * kHC + s) * N + i] = v;
 }
 
-/// mHC before a sublayer, one block per row: `raw` [T][24] = fn . flat(X[t]) (the 4 streams as one 4N row).
-/// mixes = raw / (rms(flat) + eps); pre = sigmoid(mix * scale0 + base) + eps; post = 2 sigmoid(...); comb =
-/// Sinkhorn(mix * scale2 + base) as [dst + 4 src]: softmax over dst, + eps, column norm, then (iters - 1) rounds of
-/// row and column norms.  h[t] = rms_norm(sum_s pre[s] X[t][s]) * w (the sublayer's input norm).
-__global__ void k_hc_pre(const float* X, const float* raw, const float* scale, const float* base, const float* w,
-                         float* h, float* post, float* comb, int N, int iters, float eps_hc, float eps) {
-    __shared__ float sh[kThreads];
+/// mHC before a sublayer, one block per row: `raw` [T][24][nsplit] = partial sums of fn . flat(X[t]) (the 4 streams as one
+/// 4N row; nsplit 1: the whole products), added in slice order.  mixes = raw / (rms(flat) + eps); pre = sigmoid(mix *
+/// scale0 + base) + eps; post = 2 sigmoid(...); comb = Sinkhorn(mix * scale2 + base) as [dst + 4 src]: softmax over dst,
+/// + eps, column norm, then (iters - 1) rounds of row and column norms (warp 0, one lane per cell).  h[t] = rms_norm(sum_s
+/// pre[s] X[t][s]) * w (the sublayer's input norm).
+__global__ void __launch_bounds__(1024) k_hc_pre(const float* X, const float* raw, int nsplit, const float* scale,
+                                                  const float* base, const float* w, float* h, float* post, float* comb, int N,
+                                                  int iters, float eps_hc, float eps) {
+    __shared__ float sh[1024];
     __shared__ float m[kMix], pre[kHC];
     const int t = blockIdx.x;
     const float* xr = X + (size_t) t * kHC * N;
@@ -127,48 +129,42 @@ __global__ void k_hc_pre(const float* X, const float* raw, const float* scale, c
     for (int i = threadIdx.x; i < kHC * N; i += blockDim.x) s += xr[i] * xr[i];
     s = block_sum(s, sh);
     const float inv = 1.0f / (sqrtf(s / (float) (kHC * N)) + eps_hc);
-    if (threadIdx.x < kMix) m[threadIdx.x] = raw[(size_t) t * kMix + threadIdx.x] * inv;
+    if (threadIdx.x < kMix) {
+        const float* rp = raw + ((size_t) t * kMix + threadIdx.x) * nsplit;
+        float v = rp[0];
+        for (int k = 1; k < nsplit; ++k) v += rp[k];
+        m[threadIdx.x] = v * inv;
+    }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        for (int j = 0; j < kHC; ++j) {
-            pre[j] = sigm(m[j] * scale[0] + base[j]) + eps_hc;
-            post[(size_t) t * kHC + j] = 2.0f * sigm(m[kHC + j] * scale[1] + base[kHC + j]);
+    if (threadIdx.x < 32) {
+        const int lane = threadIdx.x;
+        if (lane < kHC) {
+            pre[lane] = sigm(m[lane] * scale[0] + base[lane]) + eps_hc;
+            post[(size_t) t * kHC + lane] = 2.0f * sigm(m[kHC + lane] * scale[1] + base[kHC + lane]);
         }
-        float c[kHC * kHC];
-        for (int j = 0; j < kHC * kHC; ++j) c[j] = m[2 * kHC + j] * scale[2] + base[2 * kHC + j];
-        for (int sr = 0; sr < kHC; ++sr) {   // softmax over dst for each src (c[d + 4 s])
-            float mx = -INFINITY;
-            for (int d = 0; d < kHC; ++d) mx = fmaxf(mx, c[d + kHC * sr]);
-            float sum = 0.f;
-            for (int d = 0; d < kHC; ++d) {
-                const float e = expf(c[d + kHC * sr] - mx);
-                c[d + kHC * sr] = e;
-                sum += e;
-            }
-            for (int d = 0; d < kHC; ++d) c[d + kHC * sr] = c[d + kHC * sr] / sum + eps_hc;
-        }
-        auto norm_cols = [&]() {   // for each dst: over src
-            for (int d = 0; d < kHC; ++d) {
-                float sum = 0.f;
-                for (int sr = 0; sr < kHC; ++sr) sum += c[d + kHC * sr];
-                sum += eps_hc;
-                for (int sr = 0; sr < kHC; ++sr) c[d + kHC * sr] /= sum;
-            }
+        // the 4 x 4 cell of lane l (< 16): d = l % 4, src = l / 4, index d + 4 src = l; lanes 16..31 mirror 0..15
+        const int l = lane & 15;
+        float c = m[2 * kHC + l] * scale[2] + base[2 * kHC + l];
+        // softmax over dst for each src: the 4 lanes of a src group (xor 1, 2)
+        float mx = fmaxf(c, __shfl_xor_sync(0xffffffffu, c, 1));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+        float e = expf(c - mx);
+        float sm = e + __shfl_xor_sync(0xffffffffu, e, 1);
+        sm += __shfl_xor_sync(0xffffffffu, sm, 2);
+        c = e / sm + eps_hc;
+        auto col = [&](float v) {   // for each dst over src: lanes with the same l % 4 (xor 4, 8)
+            float a = v + __shfl_xor_sync(0xffffffffu, v, 4);
+            a += __shfl_xor_sync(0xffffffffu, a, 8);
+            return v / (a + eps_hc);
         };
-        auto norm_rows = [&]() {   // for each src: over dst
-            for (int sr = 0; sr < kHC; ++sr) {
-                float sum = 0.f;
-                for (int d = 0; d < kHC; ++d) sum += c[d + kHC * sr];
-                sum += eps_hc;
-                for (int d = 0; d < kHC; ++d) c[d + kHC * sr] /= sum;
-            }
+        auto row = [&](float v) {   // for each src over dst (xor 1, 2)
+            float a = v + __shfl_xor_sync(0xffffffffu, v, 1);
+            a += __shfl_xor_sync(0xffffffffu, a, 2);
+            return v / (a + eps_hc);
         };
-        norm_cols();
-        for (int it = 1; it < iters; ++it) {
-            norm_rows();
-            norm_cols();
-        }
-        for (int j = 0; j < kHC * kHC; ++j) comb[(size_t) t * kHC * kHC + j] = c[j];
+        c = col(c);
+        for (int it = 1; it < iters; ++it) c = col(row(c));
+        if (lane < 16) comb[(size_t) t * kHC * kHC + l] = c;
     }
     __syncthreads();
     float* hr = h + (size_t) t * N;
@@ -182,6 +178,19 @@ __global__ void k_hc_pre(const float* X, const float* raw, const float* scale, c
     s2 = block_sum(s2, sh);
     const float r = rsqrtf(s2 / (float) N + eps);
     for (int i = threadIdx.x; i < N; i += blockDim.x) hr[i] = hr[i] * r * w[i];
+}
+/// Split-K f32 products for the mHC mappings of a few rows: part[t][o][z] = W[o][kz .. kz + K / nsplit] . x[t][..],
+/// grid (n_out, nsplit, T), block 256.
+__global__ void k_gemv_f32_split(const float* W, const float* x, float* part, int n_in, int n_out, int nsplit) {
+    __shared__ float sh[kThreads];
+    const int o = blockIdx.x, z = blockIdx.y, t = blockIdx.z;
+    const int len = n_in / nsplit, k0 = z * len;
+    const float* wr = W + (size_t) o * n_in + k0;
+    const float* xr = x + (size_t) t * n_in + k0;
+    float a = 0.f;
+    for (int i = threadIdx.x; i < len; i += blockDim.x) a += wr[i] * xr[i];
+    a = block_sum(a, sh);
+    if (threadIdx.x == 0) part[((size_t) t * n_out + o) * nsplit + z] = a;
 }
 
 /// mHC after a sublayer: X[t][d][i] = post[d] f[t][i] + sum_s comb[d + 4 s] X[t][s][i] (in place).  grid1(T * N).
@@ -204,7 +213,7 @@ __global__ void k_hc_post(float* X, const float* f, const float* post, const flo
 
 /// The head's collapse, one block per row: raw [T][4] = fn . flat; mix = raw / sqrt(mean(flat^2) + eps); pre =
 /// sigmoid(mix * scale + base) + eps; h = rms_norm(sum_s pre[s] X[s]) * w (the output norm).
-__global__ void k_hc_head(const float* X, const float* raw, const float* scale, const float* base, const float* w,
+__global__ void k_hc_head(const float* X, const float* raw, int nsplit, const float* scale, const float* base, const float* w,
                           float* h, int N, float eps_hc, float eps) {
     __shared__ float sh[kThreads];
     __shared__ float pre[kHC];
@@ -214,7 +223,12 @@ __global__ void k_hc_head(const float* X, const float* raw, const float* scale, 
     for (int i = threadIdx.x; i < kHC * N; i += blockDim.x) s += xr[i] * xr[i];
     s = block_sum(s, sh);
     const float inv = rsqrtf(s / (float) (kHC * N) + eps_hc);
-    if (threadIdx.x < kHC) pre[threadIdx.x] = sigm(raw[(size_t) t * kHC + threadIdx.x] * inv * scale[0] + base[threadIdx.x]) + eps_hc;
+    if (threadIdx.x < kHC) {
+        const float* rp = raw + ((size_t) t * kHC + threadIdx.x) * nsplit;
+        float v = rp[0];
+        for (int k = 1; k < nsplit; ++k) v += rp[k];
+        pre[threadIdx.x] = sigm(v * inv * scale[0] + base[threadIdx.x]) + eps_hc;
+    }
     __syncthreads();
     float* hr = h + (size_t) t * N;
     float s2 = 0.f;
@@ -229,41 +243,35 @@ __global__ void k_hc_head(const float* X, const float* raw, const float* scale, 
     for (int i = threadIdx.x; i < N; i += blockDim.x) hr[i] = hr[i] * r * w[i];
 }
 
-/// The router, one block of 256 per row (256 experts): p = sigmoid(logit); the top K by p + bias (ties: lowest id),
-/// in that order; weights p / max(sum p, 6.1e-5).
+/// The router, one warp per row (n_expert <= 256: 8 per lane): p = sigmoid(logit); the top K by p + bias (ties: lowest
+/// id), in that order; weights p / (sum p + 1e-20).
 __global__ void k_router(const float* logits, const float* bias, int n_expert, int K_, int32_t* ids, float* wts) {
-    __shared__ float sv[kThreads];
-    __shared__ int si[kThreads];
-    __shared__ float pk[kMaxK];
-    const int t = blockIdx.x, e = threadIdx.x;
-    const float p = e < n_expert ? sigm(logits[(size_t) t * n_expert + e]) : 0.f;
-    float sel = e < n_expert ? p + bias[e] : -INFINITY;
-    for (int k = 0; k < K_; ++k) {
-        sv[e] = sel;
-        si[e] = e;
-        __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (e < s) {
-                const float ov = sv[e + s];
-                const int oi = si[e + s];
-                if (ov > sv[e] || (ov == sv[e] && oi < si[e])) {
-                    sv[e] = ov;
-                    si[e] = oi;
-                }
-            }
-            __syncthreads();
-        }
-        const int win = si[0];
-        __syncthreads();
-        if (e == win) {
-            ids[(size_t) t * K_ + k] = e;
-            pk[k] = p;
-            sel = -INFINITY;
-        }
-        __syncthreads();
+    const int t = blockIdx.x, lane = threadIdx.x;
+    float p[8], sel[8];
+    for (int i = 0; i < 8; ++i) {
+        const int e = i * 32 + lane;
+        p[i] = e < n_expert ? sigm(logits[(size_t) t * n_expert + e]) : 0.f;
+        sel[i] = e < n_expert ? p[i] + bias[e] : -INFINITY;
     }
-    if (e == 0) {
-        float sum = 0.f;
+    float sum = 0.f, pk[kMaxK];
+    for (int k = 0; k < K_; ++k) {
+        float v = -INFINITY;
+        int id = 0x7fffffff;
+        for (int i = 0; i < 8; ++i)
+            if (sel[i] > v) { v = sel[i]; id = i * 32 + lane; }   // ascending ids per lane: the first max is the lowest id
+        for (int x = 16; x > 0; x >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, v, x);
+            const int oi = __shfl_xor_sync(0xffffffffu, id, x);
+            if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
+        }
+        if ((id & 31) == lane) {
+            sel[id >> 5] = -INFINITY;
+            pk[k] = p[id >> 5];
+        }
+        pk[k] = __shfl_sync(0xffffffffu, pk[k], id & 31);
+        if (lane == 0) ids[(size_t) t * K_ + k] = id;
+    }
+    if (lane == 0) {
         for (int k = 0; k < K_; ++k) sum += pk[k];
         sum += 1e-20f;   // the vendor's topk_scores / (sum + 1e-20)
         for (int k = 0; k < K_; ++k) wts[(size_t) t * K_ + k] = pk[k] / sum;
@@ -279,7 +287,7 @@ __global__ void k_combine(const float* parts, const int32_t* prow, const float* 
         pk[threadIdx.x] = parts + (size_t) (prow ? prow[t * K_ + threadIdx.x] : t * K_ + threadIdx.x) * N;
     __syncthreads();
     const float* wr = wts + (size_t) t * K_;
-    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+    for (int i = blockIdx.y * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.y) {
         float acc = wr[0] * pk[0][i];
         for (int k = 1; k < K_; ++k) acc += wr[k] * pk[k][i];
         f[(size_t) t * N + i] = acc + shared[(size_t) t * N + i];
@@ -1066,39 +1074,42 @@ __global__ void k_mtp_mix(const float* hout, const float* eout, float* X, int N,
 }
 
 /// The routed entries grouped per expert, only those with a VRAM slot (slot_of[x] >= 0; null: every expert, slot =
-/// expert): one group per expert used (ascending id), its blob address, its entries in entry order.  One block.
+/// expert): one group per expert used (ascending id), its blob address, its entries in entry order.  One block of 256
+/// (n_expert <= 256): thread x counts expert x's entries, a block scan places the groups.
 __global__ void k_group(const int32_t* ids, int n_ent, int K_, int n_expert, const int32_t* slot_of, const uint8_t* blobs,
                         unsigned long long stride, unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups,
                         int32_t* ent_dst, int32_t* ent_tok) {
-    __shared__ int cnt[512], off[512];
-    for (int x = threadIdx.x; x < n_expert; x += blockDim.x) cnt[x] = 0;
+    __shared__ int scnt[256], sgrp[256];
+    const int x = threadIdx.x;
+    int c = 0;
+    const bool ok = x < n_expert && (!slot_of || slot_of[x] >= 0);
+    if (ok)
+        for (int e = 0; e < n_ent; ++e) c += ids[e] == x;
+    scnt[x] = c;
+    sgrp[x] = c > 0;
     __syncthreads();
-    for (int e = threadIdx.x; e < n_ent; e += blockDim.x)
-        if (!slot_of || slot_of[ids[e]] >= 0) atomicAdd(&cnt[ids[e]], 1);
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        int g = 0, pos = 0;
-        for (int x = 0; x < n_expert; ++x) {
-            off[x] = pos;
-            if (cnt[x] == 0) continue;
-            grp_ptr[g] = (unsigned long long) (blobs + (size_t) (slot_of ? slot_of[x] : x) * stride);
-            grp_start[g] = pos;
-            pos += cnt[x];
-            ++g;
-        }
-        grp_start[g] = pos;
-        *n_groups = g;
+    for (int d = 1; d < 256; d <<= 1) {   // inclusive scans (Hillis-Steele)
+        const int a = x >= d ? scnt[x - d] : 0, g = x >= d ? sgrp[x - d] : 0;
+        __syncthreads();
+        scnt[x] += a;
+        sgrp[x] += g;
+        __syncthreads();
     }
-    __syncthreads();
-    // entries in entry order per expert: each thread places its entries after counting the earlier ones of its expert
-    if (threadIdx.x == 0) {
-        for (int e = 0; e < n_ent; ++e) {
-            const int x = ids[e];
-            if (slot_of && slot_of[x] < 0) continue;
-            const int p = off[x]++;
-            ent_dst[p] = e;
-            ent_tok[p] = e / K_;
-        }
+    const int off = scnt[x] - c, gi = sgrp[x] - (c > 0);
+    if (c > 0) {
+        grp_ptr[gi] = (unsigned long long) (blobs + (size_t) (slot_of ? slot_of[x] : x) * stride);
+        grp_start[gi] = off;
+        int p = off;
+        for (int e = 0; e < n_ent; ++e)
+            if (ids[e] == x) {
+                ent_dst[p] = e;
+                ent_tok[p] = e / K_;
+                ++p;
+            }
+    }
+    if (x == 255) {
+        grp_start[sgrp[255]] = scnt[255];
+        *n_groups = sgrp[255];
     }
 }
 /// The prompt's routed entries sorted by expert for MMQ: bounds[x] .. bounds[x + 1] are expert x's sorted rows; sorted
@@ -1842,7 +1853,7 @@ struct Engine {
         const size_t big_in = std::max<size_t>(max_in, (size_t) kHC * N);   // the MTP h_proj: 4 rows per token
         auto F = [&](size_t n) { return (float*) al(n * 4); };
         X = F(T * kHC * N); h = F(T * N); f = F(T * N); emb = F(T * N);
-        raw = F(T * kMix); post = F(T * kHC); comb = F(T * kHC * kHC);
+        raw = F(T * kMix * kHcSplit); post = F(T * kHC); comb = F(T * kHC * kHC);
         qx = F(T * H * kHD); kx = F(T * HKV * kHD); vx = F(T * HKV * kHD); q = F(T * H * kHD); att = F(T * H * kHD);
         logits_r = F(T * (size_t) m->n_expert); ewts = F(T * Kp); eparts = F(T * Kp * N);
         g = F(T * FFmax); u = F(T * FFmax); hh = F(T * FFmax); shy = F(T * N); hfin = F(T * N);
@@ -1910,7 +1921,7 @@ struct Engine {
         CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
         prof.st = st;
         (void) Kp;
-        logits = dalloc((size_t) m->n_vocab * 2);
+        logits = dalloc((size_t) m->n_vocab * 4);   // up to 4 head rows (a verify window of 3 drafts)
         CK(cudaHostAlloc((void**) &emb_h, (size_t) tbig * N * 4, cudaHostAllocDefault));
         alloc_rows(tsmall, false, [](size_t n) {
             void* p = nullptr;
@@ -1939,9 +1950,9 @@ struct Engine {
         grp_start = dalloc_t<int32_t>((size_t) m->n_expert + 1);
         n_groups = dalloc_t<int32_t>(1);
         pos0 = dalloc_t<int32_t>(1);
-        pick = dalloc_t<int32_t>(2);
-        amv = dalloc((size_t) kArgBlocks * 2);
-        ami = dalloc_t<int32_t>((size_t) kArgBlocks * 2);
+        pick = dalloc_t<int32_t>(4);
+        amv = dalloc((size_t) kArgBlocks * 4);
+        ami = dalloc_t<int32_t>((size_t) kArgBlocks * 4);
         CK(cudaHostAlloc((void**) &hpin, 64 * sizeof(int32_t), cudaHostAllocDefault));
         n_chunk = (ctx + kChunkCells - 1) / kChunkCells;
         att_rows = (int) (H * std::min<int64_t>((int64_t) T, 8));
@@ -2010,6 +2021,17 @@ struct Engine {
     void mm(const Mat& w, const float* xin, float* out, int T) {
         prep(xin, w.n_in, T, q8);
         apply(w, q8, out, T);
+    }
+    /// The mHC mapping products for T rows into raw: split-K partials (decode, kHcSplit slices) or whole sums (GEMM).
+    static constexpr int kHcSplit = 16;
+    int hc_mix(const float* W, const float* xin, int n_out, int T) {
+        const int n_in = kHC * (int) m->n_embd;
+        if (T <= kGemmT) {
+            k_gemv_f32_split<<<dim3(n_out, kHcSplit, T), kThreads, 0, st>>>(W, xin, raw, n_in, n_out, kHcSplit);
+            return kHcSplit;
+        }
+        f32mm(W, xin, raw, n_in, n_out, T);
+        return 1;
     }
     void f32mm(const float* W, const float* xin, float* out, int n_in, int n_out, int T) {
         if (T <= kGemmT) {
@@ -2171,7 +2193,7 @@ struct Engine {
         const int N = (int) m->n_embd, Kp = (int) m->top_k, NE = (int) m->n_expert;
         const int64_t n_ent = (int64_t) T * Kp;
         f32mm(L.router, h, logits_r, N, NE, T);
-        k_router<<<T, kThreads, 0, st>>>(logits_r, L.bias, NE, Kp, ids, ewts);
+        k_router<<<T, 32, 0, st>>>(logits_r, L.bias, NE, Kp, ids, ewts);
         prof.mark("router");
         const bool hyb = L.n_slots < NE;
         quant(h, N, T, xq);   // the experts' input (q8_1)
@@ -2202,7 +2224,7 @@ struct Engine {
         } else {
             prof.mark("moe_gpu");
         }
-        k_combine<<<T, kThreads, 0, st>>>(eparts, nullptr, ewts, Kp, shy, f, N);
+        k_combine<<<dim3(T, (unsigned) ((m->n_embd + kThreads - 1) / kThreads)), kThreads, 0, st>>>(eparts, nullptr, ewts, Kp, shy, f, N);
     }
     /// The entries without a VRAM slot on the CPU pool (read in place from the mapped GGUF), merged into eparts.
     void moe_cpu(size_t li, int T) {
@@ -2277,7 +2299,7 @@ struct Engine {
         const int N = (int) m->n_embd, Kp = (int) m->top_k, NE = (int) m->n_expert, FF = (int) m->n_ff_exp;
         const int64_t n_ent = (int64_t) T * Kp;
         f32mm(L.router, h, logits_r, N, NE, T);
-        k_router<<<T, kThreads, 0, st>>>(logits_r, L.bias, NE, Kp, ids, ewts);
+        k_router<<<T, 32, 0, st>>>(logits_r, L.bias, NE, Kp, ids, ewts);
         CK(cudaMemsetAsync(rcnt, 0, (size_t) NE * 4, st));
         k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt);
         k_route_scan<<<1, 32, 0, st>>>(rcnt, NE, rbounds, rcur, rmax);
@@ -2304,14 +2326,14 @@ struct Engine {
         d.ld_dst = N;
         mctx->run(d, st);
         ffn(L.sg, L.su, L.sd, h, shy, T);
-        k_combine<<<T, kThreads, 0, st>>>(eparts, rinv, ewts, Kp, shy, f, N);
+        k_combine<<<dim3(T, (unsigned) ((m->n_embd + kThreads - 1) / kThreads)), kThreads, 0, st>>>(eparts, rinv, ewts, Kp, shy, f, N);
         prof.mark("moe_mmq");
     }
     /// A layer's attention half over T rows of X at positions p0.. (device *pos0): X += mHC(attention).
     void layer_attn(const Layer& L, size_t li, int T, int64_t p0) {
         const int N = (int) m->n_embd;
-        f32mm(L.hca_fn, X, raw, kHC * N, kMix, T);
-        k_hc_pre<<<T, kThreads, 0, st>>>(X, raw, L.hca_scale, L.hca_base, L.attn_norm, h, post, comb, N, m->hc_iters,
+        const int ns = hc_mix(L.hca_fn, X, kMix, T);
+        k_hc_pre<<<T, 1024, 0, st>>>(X, raw, ns, L.hca_scale, L.hca_base, L.attn_norm, h, post, comb, N, m->hc_iters,
                                         m->eps_hc, m->eps);
         prof.mark("hc");
         attention(L, li, T, p0);
@@ -2321,8 +2343,8 @@ struct Engine {
     /// The FFN half: X += mHC(FFN); `stg`: the staged experts (the streamed prompt), else slots + the CPU pool.
     void layer_ffn(const Layer& L, size_t li, int T, const uint8_t* stg) {
         const int N = (int) m->n_embd;
-        f32mm(L.hcf_fn, X, raw, kHC * N, kMix, T);
-        k_hc_pre<<<T, kThreads, 0, st>>>(X, raw, L.hcf_scale, L.hcf_base, L.ffn_norm, h, post, comb, N, m->hc_iters,
+        const int ns = hc_mix(L.hcf_fn, X, kMix, T);
+        k_hc_pre<<<T, 1024, 0, st>>>(X, raw, ns, L.hcf_scale, L.hcf_base, L.ffn_norm, h, post, comb, N, m->hc_iters,
                                         m->eps_hc, m->eps);
         prof.mark("hc");
         if (L.dense) {
@@ -2339,8 +2361,8 @@ struct Engine {
     /// The head over `heads` rows of X ending at Xend (exclusive): logits and greedy picks.
     void head(const float* Xh, int heads, bool mtp = false) {
         const int N = (int) m->n_embd;
-        f32mm(mtp ? m->mtp_hc_fn : m->head_fn, Xh, raw, kHC * N, kHC, heads);
-        k_hc_head<<<heads, kThreads, 0, st>>>(Xh, raw, mtp ? m->mtp_hc_scale : m->head_scale, mtp ? m->mtp_hc_base : m->head_base,
+        const int ns = hc_mix(mtp ? m->mtp_hc_fn : m->head_fn, Xh, kHC, heads);
+        k_hc_head<<<heads, kThreads, 0, st>>>(Xh, raw, ns, mtp ? m->mtp_hc_scale : m->head_scale, mtp ? m->mtp_hc_base : m->head_base,
                                               mtp ? m->mtp_fnorm : m->out_norm, hfin, N, m->eps_hc, m->eps);
         mm(m->head, hfin, logits, heads);
         k_argmax<<<dim3(kArgBlocks, heads), kThreads, 0, st>>>(logits, (int) m->n_vocab, pick, amv, ami, false);
@@ -2352,7 +2374,7 @@ struct Engine {
     // norm + the shared LM head predict token t + 2
     float* Xlast = nullptr;
     int32_t* pos_m = nullptr;
-    long long mtp_drafts = 0, mtp_accepted = 0, mtp_skipped = 0;
+    long long mtp_drafts = 0, mtp_accepted = 0, mtp_skipped = 0, mtp_passes = 0;
     bool want_top_p = false;
     float *top_part = nullptr, *top_p = nullptr;   // the draft's top probability (--mtp-min-p)
     float draft_prob() {
@@ -2638,7 +2660,7 @@ struct Engine {
             }
         }
         pos += T;
-        if (m->hybrid && T <= 2 && pos / kRebalanceEvery != (pos - T) / kRebalanceEvery) rebalance(8);
+        if (m->hybrid && T <= 4 && pos / kRebalanceEvery != (pos - T) / kRebalanceEvery) rebalance(8);
     }
     /// The GPU work of a decode forward (the host has filled hpin[0] and emb_h).
     void forward_body(int T, int heads, int64_t p0) {
@@ -2653,7 +2675,7 @@ struct Engine {
         if (heads > 0) head(X + (size_t) (T - heads) * kHC * N, heads);
     }
     void forward(const int32_t* toks, int T, int heads) {
-        if (use_graphs && T <= 2 && heads > 0 && !prof.on && dump_layers == nullptr && inject.empty() && dump_attn_layer < 0) {
+        if (use_graphs && T <= 4 && heads > 0 && !prof.on && dump_layers == nullptr && inject.empty() && dump_attn_layer < 0) {
             forward_graph(toks, T, heads);
             return;
         }
@@ -2690,7 +2712,7 @@ struct Engine {
         }
         if (heads > 0) head(X + (size_t) (T - heads) * kHC * N, heads);
         pos += T;
-        if (m->hybrid && T <= 2 && pos / kRebalanceEvery != (pos - T) / kRebalanceEvery) {
+        if (m->hybrid && T <= 4 && pos / kRebalanceEvery != (pos - T) / kRebalanceEvery) {
             rebalance(8);
             prof.mark("rebalance");
         }
@@ -2729,6 +2751,11 @@ struct Engine {
             }
         }
     }
+    void greedyN(int n, int* out) {
+        CK(cudaMemcpyAsync(hpin + 8, pick, (size_t) n * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        for (int i = 0; i < n; ++i) out[i] = hpin[8 + i];
+    }
     void greedy2(int& a, int& b) {
         CK(cudaMemcpyAsync(hpin + 8, pick, 8, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
@@ -2761,7 +2788,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int slots,
     }
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
-    const size_t reserve = (size_t) 512 << 20;
+    const size_t reserve = (size_t) (std::getenv("STRATA_MX_RESERVE_MB") ? std::atoi(std::getenv("STRATA_MX_RESERVE_MB")) : 320) << 20;
     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30)) : (fr > reserve ? fr - reserve : 0);
     std::vector<uint8_t> blob;
     const bool all = slots <= 0 && total <= budget;
@@ -2945,6 +2972,7 @@ int main(int argc, char** argv) {
     std::vector<int32_t> prompt, forced;
     bool pin = false;
     std::string kv_mode = "q8";   // --kv q8 (default) | f16
+    int mtp_draft = 1;       // --mtp-draft N: chained MTP drafts per verify window (1-3)
     float mtp_min_p = 0.f;   // draft only when the MTP head's top probability is at least this (0: always)   // f16 | q8 | auto (q8 from a 16K context)
     int n_gen = 32, ctx = 4096, chunk = 256, threads = 0, slots = 0, bench_pp = 0, bench_tg = 0;
     double expert_vram = -1;
@@ -2983,6 +3011,7 @@ int main(int argc, char** argv) {
         else if (a == "--pin-experts") pin = true;
         else if (a == "--kv") kv_mode = next();
         else if (a == "--mtp-min-p") mtp_min_p = (float) std::atof(next());
+        else if (a == "--mtp-draft") mtp_draft = std::max(1, std::min(3, std::atoi(next())));
         else if (a == "--bench-pp") bench_pp = std::atoi(next());
         else if (a == "--bench-tg") bench_tg = std::atoi(next());
         else {
@@ -3107,55 +3136,58 @@ int main(int argc, char** argv) {
     E.t_wait_route = E.t_pool = E.t_jobs = E.t_run = 0;
     const auto t1 = Clock::now();
     if (m.has_mtp && forced.empty() && !ff) {
-        // MTP drafting: draft token t + 2 from (streams at t, token t + 1), verify [t + 1, draft] in one 2-row window; the
-        // kept text is the plain greedy text
+        // MTP drafting (the vendor's MaxwellMoeMTPLayer, chained as its mtp_multistream output allows): draft d1 = token
+        // t + 2 from (main streams at t, token t + 1); chained, d2 from (the MTP layer's own streams at t, d1) at t + 1, ...;
+        // verify [t + 1, d1 .. dn] in one window of n + 1 rows; keep the accepted prefix and the main model's next token
+        // (the plain greedy text), roll the main cache back past it.  The next MTP pass rewrites the MTP cache of the kept
+        // positions from the main streams.
         int x1 = E.greedy();
         gen.push_back(x1);
         const float* min = E.Xlast;
-        int32_t mtok[2] = {x1, 0};
+        int32_t mtok[4] = {x1, 0, 0, 0};
         int R = 1;
         int64_t t = (int64_t) prompt.size() - 1;
+        const int N = (int) m.n_embd;
         while ((int) gen.size() < n_gen) {
             const auto tm = Clock::now();
+            int32_t drafts[3];
+            int nd = 0;
             E.mtp_forward(min, mtok, R, t - R + 1, nullptr, true);
-            const int d = E.greedy();
-            const bool sure = mtp_min_p <= 0.f || E.draft_prob() >= mtp_min_p;
+            int d = E.greedy();
+            bool sure = mtp_min_p <= 0.f || E.draft_prob() >= mtp_min_p;
+            int rows_out = R;
+            while (sure) {
+                drafts[nd++] = d;
+                if (nd >= mtp_draft) break;
+                // chain: the MTP layer's output streams of its last row and the draft, one position on
+                const float* cin = E.Xm + (size_t) (rows_out - 1) * kHC * N;
+                int32_t ctok = d;
+                E.mtp_forward(cin, &ctok, 1, t + nd, nullptr, true);
+                rows_out = 1;
+                d = E.greedy();
+                sure = mtp_min_p <= 0.f || E.draft_prob() >= mtp_min_p;
+            }
             E.t_mtp += ms_since(tm);
-            if (!sure) {   // a 1-token step: the draft is not worth a verify row
-                E.forward(&x1, 1, 1);
-                const int p1 = E.greedy();
-                ++E.mtp_skipped;
-                gen.push_back(p1);
-                min = E.X;
-                mtok[0] = p1;
-                R = 1;
-                t += 1;
-                x1 = p1;
-                continue;
-            }
-            int32_t win[2] = {x1, d};
-            E.forward(win, 2, 2);
-            int p1 = 0, p2 = 0;
-            E.greedy2(p1, p2);
-            ++E.mtp_drafts;
+            const int T = nd + 1;
+            int32_t win[4] = {x1, 0, 0, 0};
+            for (int i = 0; i < nd; ++i) win[i + 1] = drafts[i];
+            E.forward(win, T, T);
+            int p[4];
+            E.greedyN(T, p);
+            int acc = 0;
+            while (acc < nd && p[acc] == drafts[acc]) ++acc;
+            for (int i = 0; i < acc; ++i) gen.push_back(drafts[i]);
+            gen.push_back(p[acc]);
+            E.pos -= nd - acc;   // the rows past the kept ones are stale (overwritten by later windows)
+            E.mtp_drafts += nd;
+            E.mtp_accepted += acc;
+            if (nd == 0) ++E.mtp_skipped;
+            ++E.mtp_passes;
+            for (int j = 0; j <= acc; ++j) mtok[j] = j < acc ? drafts[j] : p[acc];
+            R = acc + 1;
             min = E.X;
-            if (p1 == d) {
-                ++E.mtp_accepted;
-                gen.push_back(d);
-                gen.push_back(p2);
-                mtok[0] = d;
-                mtok[1] = p2;
-                R = 2;
-                t += 2;
-                x1 = p2;
-            } else {
-                gen.push_back(p1);
-                E.pos -= 1;   // the draft's cell is stale (overwritten by the next window)
-                mtok[0] = p1;
-                R = 1;
-                t += 1;
-                x1 = p1;
-            }
+            t += acc + 1;
+            x1 = p[acc];
         }
         gen.resize((size_t) n_gen);
     } else
@@ -3176,10 +3208,10 @@ int main(int argc, char** argv) {
     std::printf("\n");
     if (ff) std::fclose(ff);
     if (E.dump_layers) std::fclose(E.dump_layers);
-    if (E.mtp_drafts)
-        std::fprintf(stderr, "strata-mx: MTP: %lld of %lld drafts accepted (%.1f%%), %lld low-confidence drafts skipped, %.2f "
-                     "tokens per main pass\n", E.mtp_accepted, E.mtp_drafts, 100.0 * E.mtp_accepted / E.mtp_drafts, E.mtp_skipped,
-                     (double) gen.size() / (E.mtp_drafts + E.mtp_skipped));
+    if (E.mtp_passes)
+        std::fprintf(stderr, "strata-mx: MTP (%d draft%s): %lld of %lld drafts accepted (%.1f%%), %lld passes without a draft, "
+                     "%.2f tokens per main pass\n", mtp_draft, mtp_draft > 1 ? "s chained" : "", E.mtp_accepted, E.mtp_drafts,
+                     100.0 * E.mtp_accepted / std::max(1LL, E.mtp_drafts), E.mtp_skipped, (double) gen.size() / E.mtp_passes);
     std::fprintf(stderr, "strata-mx: decode: %.1f ms waiting for the GPU up to the routers, %.1f ms in the CPU pool (%.1f building "
                  "jobs + quantizing, %.1f running), %.1f ms in MTP forwards, of %.1f ms\n",
                  E.t_wait_route, E.t_pool, E.t_jobs, E.t_run, E.t_mtp, tg_ms);
