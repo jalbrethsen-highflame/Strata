@@ -1,0 +1,8 @@
+[Unit]
+Description=Maxwell-V1-Flash API proxy (exits after MX_IDLE without a connection)
+Requires=strata-maxwell.service
+After=strata-maxwell.service
+
+[Service]
+EnvironmentFile=%h/.config/strata-maxwell/env
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=${MX_IDLE} 127.0.0.1:18094

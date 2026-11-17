@@ -1,0 +1,8 @@
+[Unit]
+Description=Maxwell-V1-Flash API on port 18093 (starts strata-maxwell on the first request)
+
+[Socket]
+ListenStream=0.0.0.0:18093
+
+[Install]
+WantedBy=sockets.target

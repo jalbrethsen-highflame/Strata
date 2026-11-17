@@ -1,0 +1,16 @@
+#!/bin/bash
+# maxwell on | off | start | stop | status | log - the Maxwell-V1-Flash server (strata-mx) on this PC
+#   on     listen on :18093; the model loads on the first request and unloads after the idle time
+#   off    stop listening and unload now (the conversation KV is saved first)
+#   start  load the model now (and listen)
+#   stop   unload now, keep listening (the next request loads it again)
+case "$1" in
+  on)     systemctl --user enable --now strata-maxwell-proxy.socket ;;
+  off)    systemctl --user disable --now strata-maxwell-proxy.socket; systemctl --user stop strata-maxwell-proxy.service strata-maxwell.service ;;
+  start)  systemctl --user start strata-maxwell-proxy.socket strata-maxwell-proxy.service ;;
+  stop)   systemctl --user stop strata-maxwell-proxy.service strata-maxwell.service ;;
+  status) systemctl --user --no-pager status strata-maxwell-proxy.socket strata-maxwell-proxy.service strata-maxwell.service | grep -E "●|Active:" ;
+          nvidia-smi --query-gpu=memory.used --format=csv,noheader | sed "s/^/GPU memory used: /" ;;
+  log)    journalctl --user -u strata-maxwell -u strata-maxwell-proxy -n 40 --no-pager; tail -5 ~/.local/state/strata-maxwell/engine.log ;;
+  *)      sed -n "2,6p" "$0"; exit 1 ;;
+esac

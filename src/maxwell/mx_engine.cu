@@ -30,7 +30,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
+#include <csignal>
+#include <deque>
+#include <iostream>
+#include <random>
 #include <mutex>
 #include <thread>
 #include <cmath>
@@ -2767,6 +2772,11 @@ struct Engine {
         CK(cudaStreamSynchronize(st));
         return hpin[8];
     }
+    void host_logits_row(int r, std::vector<float>& out) {
+        out.resize((size_t) m->n_vocab);
+        CK(cudaMemcpyAsync(out.data(), logits + (size_t) r * m->n_vocab, out.size() * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+    }
     void host_logits(std::vector<float>& out) {
         out.resize((size_t) m->n_vocab);
         CK(cudaMemcpyAsync(out.data(), logits, out.size() * 4, cudaMemcpyDeviceToHost, st));
@@ -2952,6 +2962,397 @@ bool pin_experts(Model& m) {
     return true;
 }
 
+// ------------------------------------------------------------------------------------------------ serve
+std::vector<int32_t> parse_ids(const char* s);
+struct Sampling {
+    float temperature = 0.f, top_p = 1.f, min_p = 0.f, repeat = 1.f, freq = 0.f, present = 0.f;
+    int top_k = 20, last_n = 64;
+    unsigned long long seed = 0;
+    bool greedy() const { return temperature <= 0.f && repeat == 1.f && freq == 0.f && present == 0.f; }
+};
+/// A token from one row's logits (penalties over the last last_n tokens, then temperature / top-k / top-p / min-p).
+int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
+    if (s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f)) {
+        std::map<int, int> cnt;
+        const size_t from = s.last_n < 0 || (size_t) s.last_n >= hist.size() ? 0 : hist.size() - (size_t) s.last_n;
+        for (size_t i = from; i < hist.size(); ++i) ++cnt[hist[i]];
+        for (const auto& [id, c] : cnt) {
+            float& v = lg[(size_t) id];
+            if (s.repeat != 1.f) v = v > 0 ? v / s.repeat : v * s.repeat;
+            v -= (float) c * s.freq + s.present;
+        }
+    }
+    if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
+    std::vector<int> idx(lg.size());
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
+    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
+    idx.resize((size_t) kk);
+    std::vector<double> pr(idx.size());
+    const double mx = lg[(size_t) idx[0]];
+    double sum = 0;
+    for (size_t i = 0; i < idx.size(); ++i) sum += (pr[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
+    size_t keep = idx.size();
+    double cum = 0;
+    for (size_t i = 0; i < idx.size(); ++i) {
+        if (pr[i] / sum < s.min_p * (pr[0] / sum)) { keep = i; break; }
+        cum += pr[i] / sum;
+        if (cum >= s.top_p) { keep = i + 1; break; }
+    }
+    keep = std::max<size_t>(1, keep);
+    double tot = 0;
+    for (size_t i = 0; i < keep; ++i) tot += pr[i];
+    std::uniform_real_distribution<double> u(0.0, tot);
+    double r = u(rng);
+    for (size_t i = 0; i < keep; ++i)
+        if ((r -= pr[i]) <= 0) return idx[i];
+    return idx[keep - 1];
+}
+
+// ---- the held conversation on disk (--kv-file): written at exit (stdin closed, QUIT, SIGTERM) and on SAVE, read
+// at start, so an engine stopped while idle continues the conversation without reading it again
+struct KvHeader {
+    char magic[8] = {'M', 'X', 'K', 'V', '0', '0', '0', '1'};
+    int32_t n_layers = 0, ctx = 0, kv8 = 0, hkv = 0;
+    int64_t n_live = 0, n_vocab = 0, model_bytes = 0;
+};
+bool kv_save(Engine& E, const Model& m, const std::string& path, const std::vector<int32_t>& live) {
+    const auto t0 = Clock::now();
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    KvHeader hd;
+    hd.n_layers = (int32_t) m.layers.size();
+    hd.ctx = E.ctx;
+    hd.kv8 = E.kv8;
+    hd.hkv = (int32_t) m.n_head_kv;
+    hd.n_live = (int64_t) live.size();
+    hd.n_vocab = m.n_vocab;
+    hd.model_bytes = (int64_t) m.file->shard(0).file_size();
+    std::fwrite(&hd, sizeof(hd), 1, f);
+    std::fwrite(live.data(), 4, live.size(), f);
+    const size_t n = live.size(), HKV = (size_t) m.n_head_kv;
+    std::vector<uint8_t> buf;
+    auto put = [&](const void* dev, size_t bytes) {
+        buf.resize(bytes);
+        if (bytes) CK(cudaMemcpy(buf.data(), dev, bytes, cudaMemcpyDeviceToHost));
+        std::fwrite(buf.data(), 1, bytes, f);
+    };
+    CK(cudaDeviceSynchronize());
+    for (size_t li = 0; li < m.layers.size(); ++li) {
+        const KVP& kv = E.kvs[li];
+        for (size_t g = 0; g < HKV; ++g) {
+            const size_t row = g * (size_t) E.ctx;
+            if (E.kv8) {
+                put(kv.k8 + row * kHD, n * kHD);
+                put(kv.v8 + row * kHD, n * kHD);
+                put(kv.ks + row, n * 4);
+                put(kv.vs + row, n * 4);
+            } else {
+                put(kv.k + row * kHD, n * kHD * 2);
+                put(kv.v + row * kHD, n * kHD * 2);
+            }
+        }
+        put(E.ikc[li], n * kIdxDim * 2);
+    }
+    const bool ok = std::fclose(f) == 0 && std::rename(tmp.c_str(), path.c_str()) == 0;
+    std::fprintf(stderr, "strata-mx: KV of %zu tokens %s %s in %.1f s\n", n, ok ? "saved to" : "NOT saved to", path.c_str(),
+                 ms_since(t0) / 1000.0);
+    return ok;
+}
+bool kv_load(Engine& E, const Model& m, const std::string& path, std::vector<int32_t>& live) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    const auto t0 = Clock::now();
+    KvHeader hd, want;
+    want.n_layers = (int32_t) m.layers.size();
+    want.ctx = E.ctx;
+    want.kv8 = E.kv8;
+    want.hkv = (int32_t) m.n_head_kv;
+    want.n_vocab = m.n_vocab;
+    want.model_bytes = (int64_t) m.file->shard(0).file_size();
+    const bool hdr_ok = std::fread(&hd, sizeof(hd), 1, f) == 1 && std::memcmp(hd.magic, want.magic, 8) == 0 &&
+                        hd.n_layers == want.n_layers && hd.kv8 == want.kv8 && hd.hkv == want.hkv && hd.n_vocab == want.n_vocab &&
+                        hd.model_bytes == want.model_bytes && hd.n_live >= 0 && hd.n_live <= E.ctx;
+    if (!hdr_ok) {
+        std::fclose(f);
+        std::fprintf(stderr, "strata-mx: %s is from another model, context, layer count or KV mode: not used\n", path.c_str());
+        return false;
+    }
+    const size_t n = (size_t) hd.n_live, HKV = (size_t) m.n_head_kv, old_ctx = (size_t) hd.ctx;
+    (void) old_ctx;
+    live.resize(n);
+    bool ok = std::fread(live.data(), 4, n, f) == n;
+    std::vector<uint8_t> buf;
+    auto get = [&](void* dev, size_t bytes) {
+        buf.resize(bytes);
+        ok = ok && std::fread(buf.data(), 1, bytes, f) == bytes;
+        if (ok && bytes) CK(cudaMemcpy(dev, buf.data(), bytes, cudaMemcpyHostToDevice));
+    };
+    for (size_t li = 0; li < m.layers.size() && ok; ++li) {
+        const KVP& kv = E.kvs[li];
+        for (size_t g = 0; g < HKV; ++g) {
+            const size_t row = g * (size_t) E.ctx;   // the cells at their positions in this context's layout
+            if (E.kv8) {
+                get(kv.k8 + row * kHD, n * kHD);
+                get(kv.v8 + row * kHD, n * kHD);
+                get(kv.ks + row, n * 4);
+                get(kv.vs + row, n * 4);
+            } else {
+                get(kv.k + row * kHD, n * kHD * 2);
+                get(kv.v + row * kHD, n * kHD * 2);
+            }
+        }
+        get(E.ikc[li], n * kIdxDim * 2);
+    }
+    std::fclose(f);
+    if (!ok) {
+        live.clear();
+        std::fprintf(stderr, "strata-mx: %s is truncated: not used\n", path.c_str());
+        return false;
+    }
+    E.pos = (int64_t) n;
+    std::fprintf(stderr, "strata-mx: KV of %zu tokens restored from %s in %.1f s\n", n, path.c_str(), ms_since(t0) / 1000.0);
+    return true;
+}
+
+volatile std::sig_atomic_t g_term = 0;
+void on_term(int) { g_term = 1; }
+
+/// --serve: the engine protocol of Strata's engines on stdin / stdout.  `GEN <max_new> [key=value ...] <id,id,...>`
+/// (keys: temperature top_p top_k min_p penalty_last_n penalty_repeat penalty_freq penalty_present seed) -> `PP` once
+/// the prompt is read, `T <id>` per token, `DONE <produced> <prompt> <prompt_ms> <decode_ms> <finish> <accepted>
+/// <offered> <reused> <read>`; `STOP` ends the running request; `SAVE` writes the KV file; `QUIT` (or the end of stdin)
+/// writes it and exits.  The held conversation's longest common prefix with a prompt is reused; MTP drafts are verified
+/// against the main model's own choice at each row (greedy: its pick; sampled: a sample from its distribution), so the
+/// output follows the main model exactly.
+int serve(Engine& E, const Model& m, const std::string& kv_file, int mtp_draft, float mtp_min_p) {
+    std::signal(SIGTERM, on_term);
+    std::signal(SIGINT, on_term);
+    std::vector<int32_t> live;   // the tokens whose KV the engine holds (cells 0 .. size - 1)
+    {   // warm-up before READY (kernel modules, cuBLAS, the decode graphs, a streamed prompt), then a fresh state: the
+        // first request does not pay for them.  Before the KV file is read, so the held conversation is not touched.
+        const auto tw = Clock::now();
+        std::vector<int32_t> toks(320);
+        for (size_t i = 0; i < toks.size(); ++i) toks[i] = (int32_t) (1000 + (i * 7919) % 50000);
+        E.reset();
+        E.process(toks.data(), 16);
+        E.reset();
+        E.process(toks.data(), (int64_t) toks.size());   // the streamed path when it streams (>= stream_min)
+        int32_t w[4] = {E.greedy(), 202, 202, 202};
+        for (int T = 1; T <= std::min(4, (m.has_mtp ? mtp_draft : 0) + 1); ++T) E.forward(w, T, T);
+        if (m.has_mtp) {
+            E.mtp_forward(E.Xlast, w, 1, E.pos - 1, nullptr, true);
+            E.mtp_forward(E.X, w, 2, E.pos - 2, nullptr, true);
+        }
+        E.greedy();
+        E.reset();
+        std::fprintf(stderr, "strata-mx: warm-up in %.1f s\n", ms_since(tw) / 1000.0);
+    }
+    if (!kv_file.empty()) kv_load(E, m, kv_file, live);
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> q;
+    bool eof = false;
+    std::atomic<bool> stop{false};
+    std::thread rd([&] {
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            if (line == "STOP") {
+                stop.store(true);
+                continue;
+            }
+            std::lock_guard<std::mutex> lk(mu);
+            q.push_back(line);
+            cv.notify_all();
+        }
+        std::lock_guard<std::mutex> lk(mu);
+        eof = true;
+        cv.notify_all();
+    });
+    rd.detach();
+    const int N = (int) m.n_embd;
+    std::printf("INFO engine=strata-mx family=maxwell-moe kv=%s mtp=%d restored=%zu expert_slots=%d\n", E.kv8 ? "q8" : "f16",
+                m.has_mtp ? mtp_draft : 0, live.size(), m.layers[(size_t) m.n_dense].n_slots);
+    std::printf("READY %d stop\n", E.ctx);
+    std::fflush(stdout);
+    std::vector<float> lg;
+    auto is_eos = [](int t) { return t == 200001 || t == 2; };
+    for (;;) {
+        std::string line;
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait_for(lk, std::chrono::milliseconds(200), [&] { return !q.empty() || eof; });
+            if (g_term) break;
+            if (q.empty()) {
+                if (eof) break;
+                continue;
+            }
+            line = q.front();
+            q.pop_front();
+        }
+        if (line == "QUIT") break;
+        if (line == "SAVE") {
+            if (!kv_file.empty()) kv_save(E, m, kv_file, live);
+            std::printf("SAVED %zu\n", live.size());
+            std::fflush(stdout);
+            continue;
+        }
+        if (line.rfind("GEN ", 0) != 0) {
+            std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n");
+            std::fflush(stdout);
+            continue;
+        }
+        char* p = const_cast<char*>(line.c_str()) + 4;
+        const long long max_new = std::strtoll(p, &p, 10);
+        Sampling smp;
+        for (;;) {
+            while (*p == ' ') ++p;
+            const char* s0 = p;
+            while (*p && *p != ' ') ++p;
+            const std::string tk(s0, (size_t) (p - s0));
+            const size_t eq = tk.find('=');
+            if (tk.empty() || eq == std::string::npos) { p = const_cast<char*>(s0); break; }
+            const std::string key = tk.substr(0, eq);
+            const char* v = tk.c_str() + eq + 1;
+            if (key == "temperature") smp.temperature = std::strtof(v, nullptr);
+            else if (key == "top_p") smp.top_p = std::strtof(v, nullptr);
+            else if (key == "top_k") smp.top_k = std::atoi(v);
+            else if (key == "min_p") smp.min_p = std::strtof(v, nullptr);
+            else if (key == "penalty_last_n") smp.last_n = std::atoi(v);
+            else if (key == "penalty_repeat") smp.repeat = std::strtof(v, nullptr);
+            else if (key == "penalty_freq") smp.freq = std::strtof(v, nullptr);
+            else if (key == "penalty_present") smp.present = std::strtof(v, nullptr);
+            else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
+        }
+        const std::vector<int32_t> ids = parse_ids(p);
+        bool bad = max_new < 1 || ids.empty();
+        for (int32_t t : ids) bad |= t < 0 || t >= (int32_t) m.n_vocab;
+        if (bad || (int64_t) ids.size() + max_new > E.ctx) {
+            std::printf("ERR bad request: max_new, the ids, or prompt (%zu) + max_new (%lld) over the context (%d)\n", ids.size(),
+                        max_new, E.ctx);
+            std::fflush(stdout);
+            continue;
+        }
+        stop.store(false);
+        // the held conversation's common prefix (at least the last prompt token is read again: its logits)
+        size_t reuse = 0;
+        while (reuse < live.size() && reuse < ids.size() && live[reuse] == ids[reuse]) ++reuse;
+        if (reuse >= ids.size()) reuse = ids.size() - 1;
+        live.resize(reuse);
+        E.pos = (int64_t) reuse;
+        const auto t0 = Clock::now();
+        const int64_t fresh = (int64_t) (ids.size() - reuse);
+        E.process(ids.data() + reuse, fresh);
+        live.insert(live.end(), ids.begin() + (long) reuse, ids.end());
+        const double prompt_ms = ms_since(t0);
+        std::printf("PP %lld %lld %.0f %.1f\n", (long long) fresh, (long long) fresh, prompt_ms, fresh * 1000.0 / std::max(1e-9, prompt_ms));
+        std::fflush(stdout);
+        std::mt19937_64 rng(smp.seed ? smp.seed : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count());
+        std::vector<int32_t> hist = ids;
+        long long produced = 0, offered = 0, accepted = 0;
+        const char* finish = "length";
+        const auto d0 = Clock::now();
+        auto emit = [&](int t) {   // false: the answer ends here
+            std::printf("T %d\n", t);
+            std::fflush(stdout);
+            ++produced;
+            hist.push_back(t);
+            if (is_eos(t)) { finish = "stop"; return false; }
+            if (produced >= max_new) return false;
+            if (stop.load() || g_term) { finish = "cancel"; return false; }
+            return true;
+        };
+        auto pick_row = [&](int r, const int* greedy_picks) {
+            if (smp.greedy()) return greedy_picks[r];
+            E.host_logits_row(r, lg);
+            return sample(lg, smp, hist, rng);
+        };
+        int gp0[1];
+        if (smp.greedy()) gp0[0] = E.greedy();
+        int x1 = pick_row(0, gp0);
+        if (m.has_mtp) {
+            const float* min = E.Xlast;
+            int32_t mtok[4] = {x1, 0, 0, 0};
+            int R = 1;
+            int64_t t = (int64_t) ids.size() - 1;
+            if (emit(x1))
+                for (;;) {
+                    if (E.pos + mtp_draft + 1 > E.ctx) break;
+                    int32_t drafts[3];
+                    int nd = 0;
+                    E.mtp_forward(min, mtok, R, t - R + 1, nullptr, true);
+                    int d = E.greedy();
+                    bool sure = mtp_min_p <= 0.f || E.draft_prob() >= mtp_min_p;
+                    int rows_out = R;
+                    while (sure) {
+                        drafts[nd++] = d;
+                        if (nd >= mtp_draft) break;
+                        const float* cin = E.Xm + (size_t) (rows_out - 1) * kHC * N;
+                        int32_t ctok = d;
+                        E.mtp_forward(cin, &ctok, 1, t + nd, nullptr, true);
+                        rows_out = 1;
+                        d = E.greedy();
+                        sure = mtp_min_p <= 0.f || E.draft_prob() >= mtp_min_p;
+                    }
+                    const int T = nd + 1;
+                    int32_t win[4] = {x1, 0, 0, 0};
+                    for (int i = 0; i < nd; ++i) win[i + 1] = drafts[i];
+                    E.forward(win, T, T);
+                    int gp[4] = {0, 0, 0, 0};
+                    if (smp.greedy()) E.greedyN(T, gp);
+                    // row r's choice, sampled after the drafts before it are in the history (their verify is exact)
+                    int acc = 0, nxt = 0;
+                    for (;;) {
+                        nxt = pick_row(acc, gp);
+                        if (acc < nd && nxt == drafts[acc]) {
+                            hist.push_back(drafts[acc]);
+                            ++acc;
+                            continue;
+                        }
+                        break;
+                    }
+                    for (int i = 0; i < acc; ++i) hist.pop_back();   // emit() pushes them again
+                    live.push_back(x1);
+                    for (int i = 0; i < acc; ++i) live.push_back(drafts[i]);
+                    E.pos -= nd - acc;
+                    offered += nd;
+                    accepted += acc;
+                    bool more = true;
+                    for (int i = 0; i < acc && more; ++i) more = emit(drafts[i]);
+                    if (more) more = emit(nxt);
+                    if (!more) break;
+                    for (int j = 0; j <= acc; ++j) mtok[j] = j < acc ? drafts[j] : nxt;
+                    R = acc + 1;
+                    min = E.X;
+                    t += acc + 1;
+                    x1 = nxt;
+                }
+        } else {
+            int x = x1;
+            while (emit(x) && E.pos + 1 <= E.ctx) {
+                E.forward(&x, 1, 1);
+                live.push_back(x);
+                int g1[1];
+                if (smp.greedy()) g1[0] = E.greedy();
+                x = pick_row(0, g1);
+            }
+        }
+        const double decode_ms = ms_since(d0);
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu %lld\n", produced, ids.size(), prompt_ms, decode_ms, finish, accepted,
+                    offered, reuse, (long long) fresh);
+        std::fflush(stdout);
+        std::fprintf(stderr, "strata-mx serve: prompt %zu tokens = %zu reused + %lld read in %.0f ms (%.1f tok/s), %lld generated in "
+                     "%.0f ms (%.1f tok/s), drafts accepted %lld of %lld (%s)\n", ids.size(), reuse, (long long) fresh, prompt_ms,
+                     fresh * 1000.0 / std::max(1e-9, prompt_ms), produced, decode_ms, produced * 1000.0 / std::max(1e-9, decode_ms),
+                     accepted, offered, finish);
+        if (g_term) break;
+    }
+    if (!kv_file.empty()) kv_save(E, m, kv_file, live);
+    std::fflush(stdout);
+    std::_Exit(0);   // the reader thread may still block on stdin
+}
+
 std::vector<int32_t> parse_ids(const char* s) {
     std::vector<int32_t> v;
     while (*s) {
@@ -2972,6 +3373,8 @@ int main(int argc, char** argv) {
     std::vector<int32_t> prompt, forced;
     bool pin = false;
     std::string kv_mode = "q8";   // --kv q8 (default) | f16
+    bool serve_mode = false;
+    std::string kv_file;     // --kv-file F: the held conversation's KV written at exit and read at start (--serve)
     int mtp_draft = 1;       // --mtp-draft N: chained MTP drafts per verify window (1-3)
     float mtp_min_p = 0.f;   // draft only when the MTP head's top probability is at least this (0: always)   // f16 | q8 | auto (q8 from a 16K context)
     int n_gen = 32, ctx = 4096, chunk = 256, threads = 0, slots = 0, bench_pp = 0, bench_tg = 0;
@@ -3012,6 +3415,8 @@ int main(int argc, char** argv) {
         else if (a == "--kv") kv_mode = next();
         else if (a == "--mtp-min-p") mtp_min_p = (float) std::atof(next());
         else if (a == "--mtp-draft") mtp_draft = std::max(1, std::min(3, std::atoi(next())));
+        else if (a == "--serve") serve_mode = true;
+        else if (a == "--kv-file") kv_file = next();
         else if (a == "--bench-pp") bench_pp = std::atoi(next());
         else if (a == "--bench-tg") bench_tg = std::atoi(next());
         else {
@@ -3055,6 +3460,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     vram("expert slots");
+    if (serve_mode) return serve(E, m, kv_file, mtp_draft, mtp_min_p);
     if (bench_pp > 0 || bench_tg > 0) {
         std::vector<int32_t> toks((size_t) std::max(bench_pp, 1));
         for (size_t i = 0; i < toks.size(); ++i) toks[i] = (int32_t) (1000 + (i * 7919) % 50000);
